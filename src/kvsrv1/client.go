@@ -4,6 +4,7 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/tester1"
+	"time"
 )
 
 
@@ -29,8 +30,16 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
-	// You will have to modify this function.
-	return "", 0, rpc.ErrNoKey
+	args := &rpc.GetArgs{Key: key}
+	var reply rpc.GetReply
+
+	for {
+		ok := ck.clnt.Call(ck.server, "KVServer.Get", args, &reply)
+		if ok {
+			return reply.Value, reply.Version, reply.Err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // Put updates key with value only if the version in the
@@ -51,6 +60,30 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
-	return rpc.ErrNoKey
+	args := &rpc.PutArgs{Key: key, Value: value, Version: version}
+	var reply rpc.PutReply
+
+	maybeLost := false // 标记是否有 RPC 可能已成功但响应丢失
+
+	for {
+		ok := ck.clnt.Call(ck.server, "KVServer.Put", args, &reply)
+		if ok {
+			if reply.Err == rpc.OK {
+				return rpc.OK
+			}
+			if reply.Err == rpc.ErrVersion {
+				if maybeLost {
+					// 之前可能有过成功的 Put 但响应丢失
+					return rpc.ErrMaybe
+				}
+				// 第一次收到 ErrVersion，直接返回
+				return rpc.ErrVersion
+			}
+			// 其他错误直接返回
+			return reply.Err
+		}
+		// RPC 没有返回，可能之前有成功的 Put 但响应丢失
+		maybeLost = true
+		time.Sleep(10 * time.Millisecond)
+	}
 }
