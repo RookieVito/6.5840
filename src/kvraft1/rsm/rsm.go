@@ -85,121 +85,109 @@ func (rsm *RSM) Raft() raftapi.Raft {
 
 func (rsm *RSM) reader() {
 	for msg := range rsm.applyCh {
-		err_msg := ""
 		if msg.SnapshotValid {
-			// install snapshot
-			err_msg = rsm.ingestSnap(msg.Snapshot, msg.SnapshotIndex)
-		} else if msg.CommandValid {
-			if msg.CommandIndex != rsm.lastApplied+1 {
-				// 判断是不是应该apply的log entry, cmd执行的顺序应该与log的记录顺序一致
-				err_msg = "rsm apply out of order"
+			if err := rsm.ingestSnap(msg.Snapshot, msg.SnapshotIndex); err != "" {
+				fmt.Println(err)
 			}
-			rsm.lastApplied = msg.CommandIndex
-
-			result := rsm.sm.DoOp(msg.Command.(Op).Req)
-
-			// 1.判断是否需要快照
-			if rsm.maxraftstate != -1 && float32(rsm.rf.PersistBytes()) > float32(rsm.maxraftstate)*0.9 {
-				// 创建快照
-				snapshot := rsm.sm.Snapshot() // 获取kvServer的snapshot
-				rsm.rf.Snapshot(msg.CommandIndex, snapshot)
-			} else {
-				// Ignore other types of ApplyMsg
-			}
-
-			// 2.如果是自己submit的cmd，需要自己唤醒需要的submit线程
-			if msg.Command.(Op).Me != rsm.me {
-				// 如果submitServer不是自己，说明自己不是leader，仅执行
-				continue
-			}
-
-			rsm.mu.Lock()
-			if ch, ok := rsm.pending[msg.Command.(Op).Id]; ok {
-				rsm.results[msg.Command.(Op).Id] = result
-				rsm.mu.Unlock()
-				ch <- struct{}{}
-				continue
-			}
-			rsm.mu.Unlock()
-
-		} else {
-			// Ignore other types of ApplyMsg.
+			continue
 		}
-		if err_msg != "" {
-			fmt.Println(err_msg)
+
+		if !msg.CommandValid {
+			continue
+		}
+		rsm.mu.Lock()
+		if msg.CommandIndex != rsm.lastApplied+1 {
+			fmt.Println("rsm apply out of order")
+		}
+		rsm.lastApplied = msg.CommandIndex
+		rsm.mu.Unlock()
+
+		op := msg.Command.(Op)
+		result := rsm.sm.DoOp(op.Req)
+
+		// 判断是否需要创建快照
+		if rsm.maxraftstate != -1 && float32(rsm.rf.PersistBytes()) > float32(rsm.maxraftstate)*0.9 {
+			snapshot := rsm.sm.Snapshot()
+			rsm.rf.Snapshot(msg.CommandIndex, snapshot)
+		}
+
+		// 只通知自己 submit 的请求
+		if op.Me != rsm.me {
+			continue
+		}
+
+		rsm.mu.Lock()
+		ch, ok := rsm.pending[op.Id]
+		if ok {
+			rsm.results[op.Id] = result
+			delete(rsm.pending, op.Id) // 先删，防止Submit超时时重复操作
+		}
+		rsm.mu.Unlock()
+
+		if ok {
+			// 用非阻塞发送，防止Submit已超时退出导致永久阻塞
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
 		}
 	}
 }
 
-// Submit a command to Raft, and wait for it to be committed.  It
-// should return ErrWrongLeader if client should find new leader and
-// try again.
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
-
 	rsm.mu.Lock()
 	id := rsm.nextId
-	op := Op{Me: rsm.me, Id: id, Req: req}
-	ch := make(chan struct{})
-	rsm.pending[rsm.nextId] = ch
 	rsm.nextId++
+	op := Op{Me: rsm.me, Id: id, Req: req}
+	ch := make(chan struct{}, 1) // 用带缓冲的channel，防止reader阻塞
+	rsm.pending[id] = ch
 	rsm.mu.Unlock()
 
 	_, submitTerm, submitIsLeader := rsm.Raft().Start(op)
 
 	if !submitIsLeader {
+		// 清理pending
+		rsm.mu.Lock()
+		delete(rsm.pending, id)
+		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil
 	}
 
 	start := time.Now()
 	for {
-		// 判断是否term没变
-		// 判断ch是否有通知
-		// 如果超时10秒，删除map中id对应的元素
-
-		curTerm, _ := rsm.Raft().GetState()
-		rsm.mu.Lock()
-		if time.Since(start) >= 10*time.Second || curTerm != submitTerm {
-			reply, ok := rsm.results[id]
-			delete(rsm.results, id)
-			if ch, ok := rsm.pending[id]; ok {
-				close(ch)
-				delete(rsm.pending, id)
-			}
-
-			if ok {
-				rsm.mu.Unlock()
-				return rpc.OK, reply
-			} else {
-				rsm.mu.Unlock()
-				return rpc.ErrWrongLeader, nil
-			}
-		}
-		rsm.mu.Unlock()
-
 		select {
-		case _, ok := <-ch:
+		case <-ch:
 			rsm.mu.Lock()
-			reply, ok := rsm.results[id]
-
+			result, ok := rsm.results[id]
 			delete(rsm.results, id)
-			if ch, ok := rsm.pending[id]; ok {
-				close(ch)
-				delete(rsm.pending, id)
-			}
 			rsm.mu.Unlock()
 			if ok {
-				return rpc.OK, reply
-			} else {
-				return rpc.ErrWrongLeader, nil
+				return rpc.OK, result
 			}
-
+			return rpc.ErrWrongLeader, nil
 		default:
-			time.Sleep(10 * time.Millisecond)
 		}
+
+		// term 变更说明 leadership 变了，这条日志大概率丢失
+		curTerm, _ := rsm.Raft().GetState()
+		if curTerm != submitTerm || time.Since(start) > 10*time.Second {
+			rsm.mu.Lock()
+			result, ok := rsm.results[id]
+			delete(rsm.results, id)
+			delete(rsm.pending, id)
+			rsm.mu.Unlock()
+			if ok {
+				return rpc.OK, result
+			}
+			return rpc.ErrWrongLeader, nil
+		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
 func (rsm *RSM) ingestSnap(snapshot []byte, index int) string {
+	// fmt.Printf("[server %d] ingestSnap index=%d\n", rsm.me, index)
 	rsm.mu.Lock()
 	defer rsm.mu.Unlock()
 

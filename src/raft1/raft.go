@@ -439,25 +439,63 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) apply() {
-	for true {
-		rf.mu.Lock()
-		if rf.lastApplied < rf.commitIndex && rf.commitIndex >= 0 {
+	for {
+		// rf.mu.Lock()
+		// if rf.lastApplied < rf.commitIndex && rf.commitIndex >= 0 {
 
-			msgs := []raftapi.ApplyMsg{}
-			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-				msgs = append(msgs, raftapi.ApplyMsg{CommandValid: true, Command: rf.log[i-rf.lastIncludedIndex].Command, CommandIndex: i})
-			}
-			rf.lastApplied = rf.commitIndex
-			rf.mu.Unlock()
+		// 	msgs := []raftapi.ApplyMsg{}
+		// 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		// 		msgs = append(msgs, raftapi.ApplyMsg{CommandValid: true, Command: rf.log[i-rf.lastIncludedIndex].Command, CommandIndex: i})
+		// 	}
+		// 	rf.lastApplied = rf.commitIndex
+		// 	rf.mu.Unlock()
 
-			for i := range msgs {
-				rf.applyCh <- msgs[i]
-			}
+		// 	for i := range msgs {
+		// 		rf.applyCh <- msgs[i]
+		// 	}
 
-		} else {
-			rf.mu.Unlock()
-		}
+		// } else {
+		// 	rf.mu.Unlock()
+		// }
+		// time.Sleep(5 * time.Millisecond)
 		time.Sleep(5 * time.Millisecond)
+		rf.mu.Lock()
+		// 优先检查是否有待发送的快照
+		// lastApplied < lastIncludedIndex 说明 InstallSnapshot 安装了新快照
+		if rf.lastApplied < rf.lastIncludedIndex {
+			msg := raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.snapshot,
+				SnapshotTerm:  rf.lastIncludedTerm,
+				SnapshotIndex: rf.lastIncludedIndex,
+			}
+			rf.lastApplied = rf.lastIncludedIndex
+			rf.mu.Unlock()
+			rf.applyCh <- msg // 此时不持锁，不会死锁
+			continue
+		}
+
+		// 发送普通的Command
+		if rf.lastApplied >= rf.commitIndex {
+			// 没有需要发送的command
+			rf.mu.Unlock()
+			continue
+		}
+
+		// 收集需要apply的Command
+		msgs := []raftapi.ApplyMsg{}
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			msgs = append(msgs, raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i-rf.lastIncludedIndex].Command,
+				CommandIndex: i,
+			})
+		}
+		rf.lastApplied = rf.commitIndex
+		rf.mu.Unlock()
+		for _, msg := range msgs {
+			rf.applyCh <- msg
+		}
 	}
 }
 
@@ -548,23 +586,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if rf.commitIndex < args.LastIncludedIndex {
 		rf.commitIndex = args.LastIncludedIndex
 	}
-	if rf.lastApplied < args.LastIncludedIndex {
-		rf.lastApplied = args.LastIncludedIndex
-	}
-
+	rf.lastApplied = 0
 	// 8. 持久化状态
 	rf.persist()
-
-	// 9. 发送快照给应用层
-	// 注意：需要在持有锁的情况下发送，或者先解锁再发送
-	// 这里选择解锁后发送，避免阻塞
 	rf.mu.Unlock()
-	rf.applyCh <- raftapi.ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      args.Data,
-		SnapshotTerm:  args.LastIncludedTerm,
-		SnapshotIndex: args.LastIncludedIndex,
-	}
 }
 
 // 处理发送InstallSnapshot的Reply
@@ -622,7 +647,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, LogEntry{Command: command, Term: term})
 	rf.persist()
 	rf.mu.Unlock()
-	go rf.broadcastAppendEntries()
+	// go rf.broadcastAppendEntries(),由peerLoop定期感知发送
 
 	return index, term, true
 }
@@ -950,9 +975,6 @@ func (rf *Raft) broadcastAppendEntries() {
 }
 
 func (rf *Raft) leaderTicker() {
-	// 成为leader，立即发送心跳
-	rf.broadcastAppendEntries()
-
 	// 为每个 follower 启动一个独立的协程，负责发送心跳或日志复制
 	for i := range len(rf.peers) {
 		if rf.me == i {
@@ -962,7 +984,7 @@ func (rf *Raft) leaderTicker() {
 	}
 
 	// 维持leader ticker，仅身份转变时退出
-	for true {
+	for {
 		rf.mu.Lock()
 		if rf.state != Leader {
 			rf.mu.Unlock()
@@ -1007,15 +1029,29 @@ func (rf *Raft) leaderTicker() {
 //
 // 每隔心跳发送
 func (rf *Raft) peerLoop(peer int) {
+	lastLogLen := 0
+	lastSendTime := time.Time{}
 	for {
 		rf.mu.Lock()
 		if rf.state != Leader {
 			rf.mu.Unlock()
 			return
 		}
-		rf.mu.Unlock()
-		time.Sleep(HeartbeatInterval)
-		go rf.sendAppendOrSnapshotOnce(peer)
+
+		currentLogLen := len(rf.log)
+		logChanged := currentLogLen != lastLogLen
+		heartbeatDue := time.Since(lastSendTime) >= HeartbeatInterval
+
+		if logChanged || heartbeatDue {
+			lastLogLen = currentLogLen
+			rf.mu.Unlock()
+			lastSendTime = time.Now()
+			go rf.sendAppendOrSnapshotOnce(peer)
+		} else {
+			rf.mu.Unlock()
+		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1053,7 +1089,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 初始化额外状态
 	rf.state = Follower
 	rf.applyCh = applyCh
-	rf.snapshot = persister.ReadSnapshot()
+	rf.snapshot = nil
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
 
@@ -1062,24 +1098,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	rf.readSnapshot(persister.ReadSnapshot())
+	// 检查是否有持久化的快照
+	if len(persister.ReadSnapshot()) > 0 {
+		rf.snapshot = persister.ReadSnapshot()
+		//如果有快照，说明commitIndex至少也是lastIncludeIndex
+		rf.commitIndex = rf.lastIncludedIndex
+		// rf.lastApplied（0） < rf.lastIncludedIndex，说明有快照需要安装，apply会执行应用快照
+	}
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.apply()
 
 	return rf
-}
-func (rf *Raft) readSnapshot(snapshot []byte) {
-	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
-		return
-	}
-	rf.snapshot = snapshot
-	rf.commitIndex = rf.lastIncludedIndex
-	rf.lastApplied = rf.lastIncludedIndex
-	applyMsg := raftapi.ApplyMsg{CommandValid: false, SnapshotValid: true,
-		Snapshot: rf.snapshot, SnapshotTerm: rf.lastIncludedTerm, SnapshotIndex: rf.lastIncludedIndex}
-	go func() {
-		rf.applyCh <- applyMsg
-	}()
 }
