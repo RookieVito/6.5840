@@ -2,6 +2,7 @@ package rsm
 
 import (
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 
 type Op struct {
 	Me  int
-	Id  uint64 // 唯一id
+	Id  int64 // 唯一id
 	Req any
 }
 
@@ -38,10 +39,9 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	nextId      uint64 // 唯一自增Id，用于唯一标识每个Op
-	pending     map[uint64]chan struct{}
+	pending     map[int64]chan struct{}
 	lastApplied int
-	results     map[uint64]any
+	results     map[int64]any
 }
 
 // servers[] contains the ports of the set of
@@ -65,15 +65,13 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
-		nextId:       0,
-		pending:      make(map[uint64]chan struct{}),
-		results:      make(map[uint64]any),
+		pending:      make(map[int64]chan struct{}),
+		results:      make(map[int64]any),
 		lastApplied:  0,
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
-
 	go rsm.reader()
 
 	return rsm
@@ -84,6 +82,9 @@ func (rsm *RSM) Raft() raftapi.Raft {
 }
 
 func (rsm *RSM) reader() {
+	if rsm.rf == nil {
+		return
+	}
 	for msg := range rsm.applyCh {
 		if msg.SnapshotValid {
 			if err := rsm.ingestSnap(msg.Snapshot, msg.SnapshotIndex); err != "" {
@@ -91,6 +92,8 @@ func (rsm *RSM) reader() {
 			}
 			continue
 		}
+
+		// fmt.Println(rsm.me, "-", msg.CommandIndex)
 
 		if !msg.CommandValid {
 			continue
@@ -136,8 +139,7 @@ func (rsm *RSM) reader() {
 
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	rsm.mu.Lock()
-	id := rsm.nextId
-	rsm.nextId++
+	id := rand.Int63()
 	op := Op{Me: rsm.me, Id: id, Req: req}
 	ch := make(chan struct{}, 1) // 用带缓冲的channel，防止reader阻塞
 	rsm.pending[id] = ch
@@ -172,13 +174,13 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		curTerm, _ := rsm.Raft().GetState()
 		if curTerm != submitTerm || time.Since(start) > 10*time.Second {
 			rsm.mu.Lock()
-			result, ok := rsm.results[id]
+			// result, ok := rsm.results[id]
 			delete(rsm.results, id)
 			delete(rsm.pending, id)
 			rsm.mu.Unlock()
-			if ok {
-				return rpc.OK, result
-			}
+			// if ok {
+			// 	return rpc.OK, result
+			// }
 			return rpc.ErrWrongLeader, nil
 		}
 
