@@ -33,10 +33,10 @@ const (
 // Raft 超时配置常量
 const (
 	// 心跳间隔：Leader 定期发送心跳的时间间隔
-	HeartbeatInterval = 100 * time.Millisecond
+	HeartbeatInterval = 200 * time.Millisecond
 
 	// Ticker 检查间隔：ticker 循环检查的睡眠时间
-	TickerInterval = 50 * time.Millisecond
+	TickerInterval = 10 * time.Millisecond
 
 	// 选举超时范围：服务器在未收到心跳时等待的最小/最大时间
 	// Raft 论文建议：election timeout >> heartbeat interval
@@ -1051,7 +1051,7 @@ func (rf *Raft) peerLoop(peer int) {
 			rf.mu.Unlock()
 		}
 
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
