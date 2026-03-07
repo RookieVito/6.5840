@@ -21,7 +21,6 @@ type KVServer struct {
 	me  int
 	rsm *rsm.RSM
 
-	// Your definitions here.
 	data map[string]ValueEntry
 	mu   sync.RWMutex
 }
@@ -123,6 +122,7 @@ func (kv *KVServer) putOp(args *rpc.PutArgs, reply *rpc.PutReply) {
 	}
 	reply.Err = rpc.OK
 }
+
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	err, rep := kv.rsm.Submit(*args)
 	if err == rpc.OK {

@@ -33,7 +33,7 @@ const (
 // Raft 超时配置常量
 const (
 	// 心跳间隔：Leader 定期发送心跳的时间间隔
-	HeartbeatInterval = 200 * time.Millisecond
+	HeartbeatInterval = 100 * time.Millisecond
 
 	// Ticker 检查间隔：ticker 循环检查的睡眠时间
 	TickerInterval = 10 * time.Millisecond
@@ -647,7 +647,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, LogEntry{Command: command, Term: term})
 	rf.persist()
 	rf.mu.Unlock()
-	// go rf.broadcastAppendEntries(),由peerLoop定期感知发送
+	// go rf.broadcastAppendEntries()
 
 	return index, term, true
 }

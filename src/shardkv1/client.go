@@ -9,19 +9,21 @@ package shardkv
 //
 
 import (
+	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp"
 
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
+	kvtest "6.5840/kvtest1"
 	"6.5840/shardkv1/shardctrler"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Clerk struct {
 	clnt *tester.Clnt
 	sck  *shardctrler.ShardCtrler
-	rcks   map[tester.Tgid]*shardgrp.Clerk
+	rcks map[tester.Tgid]*shardgrp.Clerk
 	// You will have to modify this struct.
+	cfg *shardcfg.ShardConfig
 }
 
 // The tester calls MakeClerk and passes in a shardctrler so that
@@ -32,7 +34,14 @@ func MakeClerk(clnt *tester.Clnt, sck *shardctrler.ShardCtrler) kvtest.IKVClerk 
 		sck:  sck,
 	}
 	ck.rcks = make(map[tester.Tgid]*shardgrp.Clerk)
-	// You'll have to add code here.
+
+	// 找到初始化配置
+	ck.cfg = ck.sck.Query()
+
+	// 初始化shard group的clerk
+	for gid, srvs := range ck.cfg.Groups {
+		ck.rcks[gid] = shardgrp.MakeClerk(clnt, srvs)
+	}
 	return ck
 }
 
@@ -41,19 +50,54 @@ func (ck *Clerk) GetClerk(gid tester.Tgid) (*shardgrp.Clerk, bool) {
 	return rck, ok
 }
 
-
 // Get a key from a shardgrp.  You can use shardcfg.Key2Shard(key) to
 // find the shard responsible for the key and ck.sck.Query() to read
 // the current configuration and lookup the servers in the group
 // responsible for key.  You can make a clerk for that group by
 // calling shardgrp.MakeClerk(ck.clnt, servers).
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
-	// You will have to modify this function.
-	return "", 0, ""
+	for {
+		shard := shardcfg.Key2Shard(key) // key -> shard
+		gid := ck.cfg.Shards[shard]      // shard -> group
+		grpCk, ok := ck.GetClerk(gid)    // group -> group.clerk
+		if ok {
+			value, version, err := grpCk.Get(key)
+			if err == rpc.OK || err == rpc.ErrNoKey {
+				return value, version, err
+			}
+		}
+
+		// err == rpc.ErrWrongGroup || ok == false
+		// 组错误或者没有找到group对应的clerk，说明配置应该更新
+		ck.refreshConfig()
+	}
 }
 
 // Put a key to a shard group.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
-	return ""
+	for {
+		shard := shardcfg.Key2Shard(key) // key -> shard
+		gid := ck.cfg.Shards[shard]      // shard -> group
+		grpCk, ok := ck.GetClerk(gid)    // group -> group.clerk
+		if ok {
+			// 找到了 group的clerk
+			err := grpCk.Put(key, value, version)
+			if err == rpc.ErrMaybe || err == rpc.ErrVersion || err == rpc.OK {
+				return err
+			}
+		}
+
+		// err == rpc.ErrWrongGroup || ok == false
+		// 组错误或者没有找到group对应的clerk，说明配置应该更新
+		ck.refreshConfig()
+	}
+}
+
+func (ck *Clerk) refreshConfig() {
+	ck.cfg = ck.sck.Query()
+	for gid, srvs := range ck.cfg.Groups {
+		if _, exists := ck.rcks[gid]; !exists {
+			ck.rcks[gid] = shardgrp.MakeClerk(ck.clnt, srvs)
+		}
+	}
 }

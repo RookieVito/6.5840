@@ -8,7 +8,7 @@ import (
 	"slices"
 	"testing"
 
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Tshid int
@@ -37,8 +37,8 @@ func Key2Shard(key string) Tshid {
 // Please don't change this.
 type ShardConfig struct {
 	Num    Tnum                     // config number
-	Shards [NShards]tester.Tgid     // shard -> gid
-	Groups map[tester.Tgid][]string // gid -> servers[]
+	Shards [NShards]tester.Tgid     // shard -> gid(shard group Id)
+	Groups map[tester.Tgid][]string // gid(shard group Id) -> servers[]
 }
 
 func MakeShardConfig() *ShardConfig {
