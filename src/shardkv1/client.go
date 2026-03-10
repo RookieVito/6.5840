@@ -9,6 +9,8 @@ package shardkv
 //
 
 import (
+	"sync"
+
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp"
 
@@ -24,6 +26,7 @@ type Clerk struct {
 	rcks map[tester.Tgid]*shardgrp.Clerk
 	// You will have to modify this struct.
 	cfg *shardcfg.ShardConfig
+	mu  sync.Mutex
 }
 
 // The tester calls MakeClerk and passes in a shardctrler so that
@@ -57,9 +60,11 @@ func (ck *Clerk) GetClerk(gid tester.Tgid) (*shardgrp.Clerk, bool) {
 // calling shardgrp.MakeClerk(ck.clnt, servers).
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	for {
+		ck.mu.Lock()
 		shard := shardcfg.Key2Shard(key) // key -> shard
 		gid := ck.cfg.Shards[shard]      // shard -> group
 		grpCk, ok := ck.GetClerk(gid)    // group -> group.clerk
+		ck.mu.Unlock()
 		if ok {
 			value, version, err := grpCk.Get(key)
 			if err == rpc.OK || err == rpc.ErrNoKey {
@@ -76,15 +81,19 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // Put a key to a shard group.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	for {
+		ck.mu.Lock()
 		shard := shardcfg.Key2Shard(key) // key -> shard
 		gid := ck.cfg.Shards[shard]      // shard -> group
 		grpCk, ok := ck.GetClerk(gid)    // group -> group.clerk
+		ck.mu.Unlock()
 		if ok {
 			// 找到了 group的clerk
 			err := grpCk.Put(key, value, version)
+
 			if err == rpc.ErrMaybe || err == rpc.ErrVersion || err == rpc.OK {
 				return err
 			}
+
 		}
 
 		// err == rpc.ErrWrongGroup || ok == false
@@ -94,7 +103,12 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 }
 
 func (ck *Clerk) refreshConfig() {
-	ck.cfg = ck.sck.Query()
+
+	cfg := ck.sck.Query()
+	// fmt.Println("shard clerk: refreshConfig: ", cfg.String())
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	ck.cfg = cfg
 	for gid, srvs := range ck.cfg.Groups {
 		if _, exists := ck.rcks[gid]; !exists {
 			ck.rcks[gid] = shardgrp.MakeClerk(ck.clnt, srvs)

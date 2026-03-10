@@ -5,6 +5,7 @@ package shardctrler
 //
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -50,7 +51,23 @@ func (sck *ShardCtrler) InitController() {
 // 把配置存储在lab2 的kvsrv
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 	// 传递cfg到kvsrv
-	sck.Put(configKey, cfg.String(), rpc.Tversion(0))
+	for {
+		err := sck.Put(configKey, cfg.String(), rpc.Tversion(0))
+		if err == rpc.OK {
+			return
+		}
+		if err == rpc.ErrVersion {
+			fmt.Println("init config err version")
+			return
+		}
+		if err == rpc.ErrMaybe {
+			value, _, getErr := sck.Get(configKey)
+			if getErr == rpc.OK && value == cfg.String() {
+				return
+			}
+		}
+	}
+
 }
 
 func (sck *ShardCtrler) updateConfig(new *shardcfg.ShardConfig) {
@@ -117,14 +134,34 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		wg.Add(1)
 		go func(shard shardcfg.Tshid, oldGid, newGid tester.Tgid) {
 			defer wg.Done()
+
+			if oldGid == 0 {
+				// 初始状态，该分片从未被分配过，直接安装空状态
+				newClerk := getClerk(newGid, new.Groups[newGid])
+				newClerk.InstallShard(shard, nil, new.Num)
+				return
+			}
+
+			if newGid == 0 {
+				// 组退出后 Rebalance，理论上不应出现 newGid==0
+				// 除非所有组都离开了，此时直接冻结删除
+				oldClerk := getClerk(oldGid, old.Groups[oldGid])
+				oldClerk.FreezeShard(shard, new.Num)
+				oldClerk.DeleteShard(shard, new.Num)
+				return
+			}
+
 			oldClerk := getClerk(oldGid, old.Groups[oldGid])
 			newClerk := getClerk(newGid, new.Groups[newGid])
-			state, err := oldClerk.FreezeShard(shard, new.Num) // 1
-			err = newClerk.InstallShard(shard, state, new.Num) // 2
-			err = oldClerk.DeleteShard(shard, new.Num)         // 3
-			if err == rpc.OK {
-				// TODO：暂时这样
+			state, err := oldClerk.FreezeShard(shard, new.Num) // 1 FreezeShard
+			if err != rpc.OK {
+				return
 			}
+			err = newClerk.InstallShard(shard, state, new.Num) // 2 InstallShard
+			if err != rpc.OK {
+				return
+			}
+			err = oldClerk.DeleteShard(shard, new.Num) // 3 DeleteShard
 		}(shard, oldGid, newGid)
 	}
 	wg.Wait()
