@@ -51,23 +51,7 @@ func (sck *ShardCtrler) InitController() {
 // 把配置存储在lab2 的kvsrv
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 	// 传递cfg到kvsrv
-	for {
-		err := sck.Put(configKey, cfg.String(), rpc.Tversion(0))
-		if err == rpc.OK {
-			return
-		}
-		if err == rpc.ErrVersion {
-			fmt.Println("init config err version")
-			return
-		}
-		if err == rpc.ErrMaybe {
-			value, _, getErr := sck.Get(configKey)
-			if getErr == rpc.OK && value == cfg.String() {
-				return
-			}
-		}
-	}
-
+	sck.Put(configKey, cfg.String(), rpc.Tversion(0))
 }
 
 func (sck *ShardCtrler) updateConfig(new *shardcfg.ShardConfig) {
@@ -119,17 +103,39 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 
 	// 完成Freeze/Install/Delete
 
-	// 获取旧的配置
+	// 获取旧的配置，且必须是相邻的配置，如果不是，说明有配置没有被完整完成或者这是一个太旧的配置，暂时不设置超时
 	old := sck.Query()
+	for old.Num+1 != new.Num {
+		fmt.Println("changeConfigTo: query loop")
+		old = sck.Query()
+	}
 
-	//
+	// fmt.Println("old:", old.String(), "\nnew:", new.String())
+
+	// 1.根据配置变更的情况，迁移分片
+	// 记录参与了分片变更的gid
+	involvedGids := make(map[tester.Tgid]struct{})
+	var involvedMu sync.Mutex
+
 	var wg sync.WaitGroup
 	for shard := shardcfg.Tshid(0); shard < shardcfg.NShards; shard++ {
 		oldGid := old.Shards[shard]
 		newGid := new.Shards[shard]
 		if oldGid == newGid {
-			continue // 没有迁移，跳过
+			continue
 		}
+
+		// 记录涉及的 gid
+		involvedMu.Lock()
+		if oldGid != 0 {
+			// 分片之前被分配状态才有group
+			involvedGids[oldGid] = struct{}{}
+		}
+		if newGid != 0 {
+			// 分片之后被分配状态才有group
+			involvedGids[newGid] = struct{}{}
+		}
+		involvedMu.Unlock()
 
 		wg.Add(1)
 		go func(shard shardcfg.Tshid, oldGid, newGid tester.Tgid) {
@@ -153,20 +159,42 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 
 			oldClerk := getClerk(oldGid, old.Groups[oldGid])
 			newClerk := getClerk(newGid, new.Groups[newGid])
+			// fmt.Println("shard:", shard, " : ", oldGid, " to ", newGid)
 			state, err := oldClerk.FreezeShard(shard, new.Num) // 1 FreezeShard
 			if err != rpc.OK {
+				fmt.Println("shard:", shard, " : ", oldGid, " to ", newGid, " freeze failure:", err)
 				return
 			}
 			err = newClerk.InstallShard(shard, state, new.Num) // 2 InstallShard
 			if err != rpc.OK {
+				fmt.Println("shard:", shard, " : ", oldGid, " to ", newGid, "install failure:", err)
 				return
 			}
 			err = oldClerk.DeleteShard(shard, new.Num) // 3 DeleteShard
+			if err != rpc.OK {
+				fmt.Println("shard:", shard, " : ", oldGid, " to ", newGid, "delete failure:", err)
+				return
+			}
 		}(shard, oldGid, newGid)
 	}
 	wg.Wait()
 
-	// 所有迁移完成，更新配置
+	// 对不涉及分片变更的 gid 补发空 InstallShard，推进配置版本
+	var wg2 sync.WaitGroup
+	for gid, srvs := range new.Groups {
+		if _, involved := involvedGids[gid]; involved {
+			continue
+		}
+		wg2.Add(1)
+		go func(gid tester.Tgid, srvs []string) {
+			defer wg2.Done()
+			ck := getClerk(gid, srvs)
+			ck.InstallShard(shardcfg.Tshid(-1), nil, new.Num) // 用一个无效 shard id 表示纯版本推进
+		}(gid, srvs)
+	}
+	wg2.Wait()
+
+	// 需要迁移的分片完成迁移，更新配置
 	sck.updateConfig(new)
 
 }

@@ -86,9 +86,10 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		gid := ck.cfg.Shards[shard]      // shard -> group
 		grpCk, ok := ck.GetClerk(gid)    // group -> group.clerk
 		ck.mu.Unlock()
+		var err rpc.Err
 		if ok {
 			// 找到了 group的clerk
-			err := grpCk.Put(key, value, version)
+			err = grpCk.Put(key, value, version)
 
 			if err == rpc.ErrMaybe || err == rpc.ErrVersion || err == rpc.OK {
 				return err

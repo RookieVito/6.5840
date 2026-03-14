@@ -63,7 +63,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 			ck.mu.Lock()
 			ck.leader = (ck.leader + 1) % len(ck.servers)
 			ck.mu.Unlock()
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
@@ -76,7 +76,11 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	}
 
 	count := 1
+	start := time.Now()
 	for {
+		if time.Since(start) > 5*time.Second {
+			return rpc.ErrWrongGroup
+		}
 		reply := rpc.PutReply{}
 		ck.mu.Lock()
 		leader := ck.leader
@@ -121,7 +125,7 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 			ck.mu.Lock()
 			ck.leader = (ck.leader + 1) % len(ck.servers)
 			ck.mu.Unlock()
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
@@ -154,13 +158,13 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 			if reply.Err == rpc.ErrWrongGroup {
 				return reply.State, reply.Err
 			}
-			return reply.State, reply.Err
 		} else {
 			// 网络不可靠，换节点重试
-			ck.mu.Lock()
-			ck.leader = (ck.leader + 1) % len(ck.servers)
-			ck.mu.Unlock() // time.Sleep(10 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
+		ck.mu.Lock()
+		ck.leader = (ck.leader + 1) % len(ck.servers)
+		ck.mu.Unlock()
 	}
 }
 
@@ -179,19 +183,21 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 		ok := ck.Call(ck.servers[leader], "KVServer.InstallShard", &args, &reply)
 		// fmt.Printf("InstallShard: ok=%v server=%v reply=%v\n", ok, ck.servers[ck.leader], reply)
 		if ok {
+			if reply.Err == rpc.OK {
+				return reply.Err
+			}
 			if reply.Err == rpc.ErrWrongLeader {
 				ck.mu.Lock()
 				ck.leader = (ck.leader + 1) % len(ck.servers)
 				ck.mu.Unlock()
 				continue
 			}
-			return reply.Err
 		} else {
-			ck.mu.Lock()
-			ck.leader = (ck.leader + 1) % len(ck.servers)
-			ck.mu.Unlock()
 			time.Sleep(10 * time.Millisecond)
 		}
+		ck.mu.Lock()
+		ck.leader = (ck.leader + 1) % len(ck.servers)
+		ck.mu.Unlock()
 	}
 }
 
@@ -208,18 +214,21 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 		ok := ck.Call(ck.servers[leader], "KVServer.DeleteShard", &args, &reply)
 		// fmt.Printf("DeleteShard: ok=%v server=%v reply=%v\n", ok, ck.servers[ck.leader], reply)
 		if ok {
+			if reply.Err == rpc.OK {
+				return reply.Err
+			}
+
 			if reply.Err == rpc.ErrWrongLeader {
 				ck.mu.Lock()
 				ck.leader = (ck.leader + 1) % len(ck.servers)
 				ck.mu.Unlock()
 				continue
 			}
-			return reply.Err
 		} else {
-			ck.mu.Lock()
-			ck.leader = (ck.leader + 1) % len(ck.servers)
-			ck.mu.Unlock()
 			time.Sleep(10 * time.Millisecond)
 		}
+		ck.mu.Lock()
+		ck.leader = (ck.leader + 1) % len(ck.servers)
+		ck.mu.Unlock()
 	}
 }
