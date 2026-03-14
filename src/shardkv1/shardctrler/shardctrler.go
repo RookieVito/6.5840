@@ -113,10 +113,6 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	// fmt.Println("old:", old.String(), "\nnew:", new.String())
 
 	// 1.根据配置变更的情况，迁移分片
-	// 记录参与了分片变更的gid
-	involvedGids := make(map[tester.Tgid]struct{})
-	var involvedMu sync.Mutex
-
 	var wg sync.WaitGroup
 	for shard := shardcfg.Tshid(0); shard < shardcfg.NShards; shard++ {
 		oldGid := old.Shards[shard]
@@ -124,18 +120,6 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		if oldGid == newGid {
 			continue
 		}
-
-		// 记录涉及的 gid
-		involvedMu.Lock()
-		if oldGid != 0 {
-			// 分片之前被分配状态才有group
-			involvedGids[oldGid] = struct{}{}
-		}
-		if newGid != 0 {
-			// 分片之后被分配状态才有group
-			involvedGids[newGid] = struct{}{}
-		}
-		involvedMu.Unlock()
 
 		wg.Add(1)
 		go func(shard shardcfg.Tshid, oldGid, newGid tester.Tgid) {
@@ -178,21 +162,6 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		}(shard, oldGid, newGid)
 	}
 	wg.Wait()
-
-	// 对不涉及分片变更的 gid 补发空 InstallShard，推进配置版本
-	var wg2 sync.WaitGroup
-	for gid, srvs := range new.Groups {
-		if _, involved := involvedGids[gid]; involved {
-			continue
-		}
-		wg2.Add(1)
-		go func(gid tester.Tgid, srvs []string) {
-			defer wg2.Done()
-			ck := getClerk(gid, srvs)
-			ck.InstallShard(shardcfg.Tshid(-1), nil, new.Num) // 用一个无效 shard id 表示纯版本推进
-		}(gid, srvs)
-	}
-	wg2.Wait()
 
 	// 需要迁移的分片完成迁移，更新配置
 	sck.updateConfig(new)

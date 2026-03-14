@@ -33,8 +33,9 @@ type KVServer struct {
 
 	mu sync.RWMutex
 
-	frozen      map[shardcfg.Tshid]bool // 管理是否被某分片被冻结
-	shardCfgNum shardcfg.Tnum           // 当前正在执行的配置版本
+	frozen   map[shardcfg.Tshid]bool // 管理是否被某分片被冻结
+	shardNum map[shardcfg.Tshid]shardcfg.Tnum
+	// shardCfgNum shardcfg.Tnum           // 当前正在执行的配置版本
 }
 
 func (kv *KVServer) DoOp(req any) any {
@@ -73,7 +74,8 @@ func (kv *KVServer) Snapshot() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.data) // 将kvmap制作为快照返回
 	e.Encode(kv.frozen)
-	e.Encode(kv.shardCfgNum)
+	// e.Encode(kv.shardCfgNum)
+	e.Encode(kv.shardNum)
 	return w.Bytes()
 }
 
@@ -84,13 +86,14 @@ func (kv *KVServer) Restore(data []byte) {
 	d := labgob.NewDecoder(r)
 	var kvmap map[shardcfg.Tshid]map[string]ValueEntry
 	var frozen map[shardcfg.Tshid]bool
-	var shardCfgNum shardcfg.Tnum
-	if d.Decode(&kvmap) != nil || d.Decode(&frozen) != nil || d.Decode(&shardCfgNum) != nil {
+	// var shardCfgNum shardcfg.Tnum
+	var shardNum map[shardcfg.Tshid]shardcfg.Tnum
+	if d.Decode(&kvmap) != nil || d.Decode(&frozen) != nil || d.Decode(&shardNum) != nil {
 		fmt.Println("KVstorage restore failed: data is error snapshot len:", len(data))
 	} else {
 		kv.data = kvmap
 		kv.frozen = frozen
-		kv.shardCfgNum = shardCfgNum
+		kv.shardNum = shardNum
 	}
 }
 
@@ -202,7 +205,7 @@ func (kv *KVServer) freezeShardOp(args *shardrpc.FreezeShardArgs, reply *shardrp
 
 	shard := args.Shard
 
-	if args.Num < kv.shardCfgNum {
+	if args.Num < kv.shardNum[shard] {
 		// args.Num < kv.shardCfgNum+1 网络中过期的请求
 		fmt.Println("freezeshardOp err :args.Num < kv.shardCfgNum+1")
 		reply.Err = rpc.ErrWrongGroup
@@ -257,14 +260,14 @@ func (kv *KVServer) installShardOp(args *shardrpc.InstallShardArgs, reply *shard
 
 	// 版本会在第一次install的时候被设置为最新的版本号，如果一个配置中有多个分片迁移过来，
 	// 那么，应该允许修改
-	if args.Num < kv.shardCfgNum {
+	if args.Num < kv.shardNum[shard] {
 		// 旧的rpc，丢弃
-		fmt.Println("install err ErrWrongGroup:", args.Num, " != ", kv.shardCfgNum)
+		fmt.Println("install err ErrWrongGroup:", args.Num, " != ", kv.shardNum[shard])
 		reply.Err = rpc.ErrWrongGroup
 		return
 	}
 
-	if _, exists := kv.data[shard]; args.Num == kv.shardCfgNum && exists && !kv.frozen[shard] {
+	if _, exists := kv.data[shard]; args.Num == kv.shardNum[shard] && exists && !kv.frozen[shard] {
 		// 如果配置版本相同，分片存在（之前安装分片成功，响应丢失）
 		reply.Err = rpc.OK
 		return
@@ -290,9 +293,9 @@ func (kv *KVServer) installShardOp(args *shardrpc.InstallShardArgs, reply *shard
 		}
 	}
 
-	kv.data[args.Shard] = kvmap // 安装分片
-	kv.shardCfgNum = args.Num   // 更新配置号
-	kv.frozen[shard] = false    // 该分片解冻，可以Get/Put
+	kv.data[args.Shard] = kvmap   // 安装分片
+	kv.shardNum[shard] = args.Num // 更新配置号
+	kv.frozen[shard] = false      // 该分片解冻，可以Get/Put
 
 	reply.Err = rpc.OK
 }
@@ -313,7 +316,7 @@ func (kv *KVServer) deleteShardOp(args *shardrpc.DeleteShardArgs, reply *shardrp
 	defer kv.mu.Unlock()
 	shard := args.Shard
 
-	if args.Num < kv.shardCfgNum {
+	if args.Num < kv.shardNum[shard] {
 		// args.Num > kv.shardCfgNum+1：太新的删除请求，不可能，除非changConfigTo没有对freeze的返回值进行判断
 		// args.Num < kv.shardCfgNum+1: 过期的删除请求，之前已经删除过了
 	}
@@ -321,7 +324,7 @@ func (kv *KVServer) deleteShardOp(args *shardrpc.DeleteShardArgs, reply *shardrp
 	if kv.frozen[shard] == true {
 		// 删除之前必须被冻结
 		delete(kv.data, shard)
-		kv.shardCfgNum = args.Num // 配置版本更新
+		kv.shardNum[shard] = args.Num // 配置版本更新
 	}
 
 	reply.Err = rpc.OK
@@ -357,7 +360,7 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	kv.frozen = make(map[shardcfg.Tshid]bool)
-	kv.shardCfgNum = 1
+	kv.shardNum = make(map[shardcfg.Tshid]shardcfg.Tnum)
 
 	return []any{kv, kv.rsm.Raft()}
 }
