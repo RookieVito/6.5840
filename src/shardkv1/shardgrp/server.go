@@ -97,34 +97,31 @@ func (kv *KVServer) Restore(data []byte) {
 	}
 }
 
+func (kv *KVServer) ownsShardLocked(shard shardcfg.Tshid) bool {
+	_, ok := kv.data[shard]
+	return ok && !kv.frozen[shard]
+}
+
 func (kv *KVServer) getOp(args *rpc.GetArgs, reply *rpc.GetReply) {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
-
 	shard := shardcfg.Key2Shard(args.Key)
 
-	// 判断分片是否冻结
-	if kv.frozen[shard] {
+	if !kv.ownsShardLocked(shard) {
+		// 分片未安装或已冻结，说明当前分组不负责该分片。
 		reply.Err = rpc.ErrWrongGroup
 		return
 	}
 
-	// 分片为空，说明没有这个key
-	shardData, exists := kv.data[shard]
-	if !exists {
+	if val, ok := kv.data[shard][args.Key]; !ok {
+		// 没有这个key
 		reply.Err = rpc.ErrNoKey
-		return
+	} else {
+		// 有这个key，返回值和版本号
+		reply.Value = val.Value
+		reply.Version = val.Version
+		reply.Err = rpc.OK
 	}
-
-	val, ok := shardData[args.Key]
-	if !ok {
-		// 分片中没有数据
-		reply.Err = rpc.ErrNoKey
-		return
-	}
-	reply.Value = val.Value
-	reply.Version = val.Version
-	reply.Err = rpc.OK
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -144,16 +141,10 @@ func (kv *KVServer) putOp(args *rpc.PutArgs, reply *rpc.PutReply) {
 
 	shard := shardcfg.Key2Shard(args.Key)
 
-	// 判断分片是否冻结，如果冻结：1. 这个分片要被转移。 2. 这个分片不由自己负责
-	if kv.frozen[shard] {
+	// 只有当前负责且未冻结的 shard 才能接受读写。
+	if !kv.ownsShardLocked(shard) {
 		reply.Err = rpc.ErrWrongGroup
 		return
-	}
-
-	// 如果shard不存在，创建
-	_, exists := kv.data[shard]
-	if !exists {
-		kv.data[shard] = make(map[string]ValueEntry)
 	}
 
 	val, ok := kv.data[shard][args.Key]
@@ -202,31 +193,25 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 func (kv *KVServer) freezeShardOp(args *shardrpc.FreezeShardArgs, reply *shardrpc.FreezeShardReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
 	shard := args.Shard
-
 	if args.Num < kv.shardNum[shard] {
-		// args.Num < kv.shardCfgNum+1 网络中过期的请求
-		fmt.Println("freezeshardOp err :args.Num < kv.shardCfgNum+1")
+		// 过期的冻结请求，之前已经冻结过了
 		reply.Err = rpc.ErrWrongGroup
 		return
 	}
 
-	// 冻结分片
+	// 冻结不改变配置版本号，安装和删除分片时才更新配置版本号
 	kv.frozen[shard] = true
 
-	// 序列化该分片数据
 	if _, exists := kv.data[args.Shard]; !exists {
-		// 如果不存在，建立一个空分片
+		// 如果分片不存在，建立一个空分片
 		kv.data[args.Shard] = make(map[string]ValueEntry)
 	}
+
+	// 将分片数据制作为状态返回
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	shardData := kv.data[args.Shard]
-	if shardData == nil {
-		shardData = make(map[string]ValueEntry)
-	}
-	e.Encode(shardData)
+	e.Encode(kv.data[args.Shard])
 
 	reply.State = w.Bytes()
 	reply.Num = args.Num
@@ -248,56 +233,51 @@ func (kv *KVServer) FreezeShard(args *shardrpc.FreezeShardArgs, reply *shardrpc.
 }
 
 // 只要配置版本号匹配，就安装分片，
-// 0. 处理时，如果args.Num = kv.shardCfgNum + 1，说明是相邻的配置
-// 1. 处理时，如果是args.Num = kv.shardCfgNum，说明之前install的返回可能丢失，controller重试，直接返回ok
-// 2. state是空的，那么只更新版本号，这是一个广播
-// 3.
 func (kv *KVServer) installShardOp(args *shardrpc.InstallShardArgs, reply *shardrpc.InstallShardReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
 	shard := args.Shard
 
-	// 版本会在第一次install的时候被设置为最新的版本号，如果一个配置中有多个分片迁移过来，
-	// 那么，应该允许修改
 	if args.Num < kv.shardNum[shard] {
-		// 旧的rpc，丢弃
-		fmt.Println("install err ErrWrongGroup:", args.Num, " != ", kv.shardNum[shard])
+		// 过期的安装请求，之前已经安装过了
 		reply.Err = rpc.ErrWrongGroup
-		return
-	}
-
-	if _, exists := kv.data[shard]; args.Num == kv.shardNum[shard] && exists && !kv.frozen[shard] {
-		// 如果配置版本相同，分片存在（之前安装分片成功，响应丢失）
-		reply.Err = rpc.OK
-		return
-	}
-
-	// args.Num == kv.shardCfgNum+1
-
-	// 反序列化分片数据
-	var kvmap map[string]ValueEntry
-	if args.State == nil || len(args.State) == 0 {
-		// 空状态（新加入的组），初始化空 map
-		kvmap = make(map[string]ValueEntry)
-	} else {
-		r := bytes.NewBuffer(args.State)
-		d := labgob.NewDecoder(r)
-		if d.Decode(&kvmap) != nil {
-			fmt.Println("installShardOp: decode failed, shard:", args.Shard)
+	} else if args.Num == kv.shardNum[shard] {
+		// 之前安装过了，响应丢失，controller重试
+		// 检查是否安装成功
+		if _, exists := kv.data[shard]; exists && !kv.frozen[shard] {
+			reply.Err = rpc.OK
+		} else {
+			// 没有安装成功，不应该出现的错误，因为版本号已经更新了，说明之前安装成功了
 			reply.Err = rpc.ErrWrongGroup
-			return
 		}
-		if kvmap == nil {
+	} else {
+		// args.Num > kv.shardCfgNum+1：太新的安装请求不可能出现
+		// changeConfigTo只接受比当前配置版本号大1的配置更新
+		// 所以，controller不可能发出一个版本号大于kv.shardCfgNum+1的安装请求
+
+		// 正常安装
+		var kvmap map[string]ValueEntry
+		if args.State == nil || len(args.State) == 0 {
+			// 空状态（新加入的组），初始化空 map
 			kvmap = make(map[string]ValueEntry)
+		} else {
+			r := bytes.NewBuffer(args.State)
+			d := labgob.NewDecoder(r)
+			if d.Decode(&kvmap) != nil {
+				fmt.Println("installShardOp: decode failed, shard:", args.Shard)
+				reply.Err = rpc.ErrWrongGroup
+				return
+			}
+			if kvmap == nil {
+				kvmap = make(map[string]ValueEntry)
+			}
 		}
+
+		kv.data[args.Shard] = kvmap   // 安装分片
+		kv.shardNum[shard] = args.Num // 更新配置号
+		kv.frozen[shard] = false      // 该分片解冻，配置更新后可以Get/Put
+		reply.Err = rpc.OK
 	}
-
-	kv.data[args.Shard] = kvmap   // 安装分片
-	kv.shardNum[shard] = args.Num // 更新配置号
-	kv.frozen[shard] = false      // 该分片解冻，可以Get/Put
-
-	reply.Err = rpc.OK
 }
 
 // Install the supplied state for the specified shard.
@@ -317,17 +297,26 @@ func (kv *KVServer) deleteShardOp(args *shardrpc.DeleteShardArgs, reply *shardrp
 	shard := args.Shard
 
 	if args.Num < kv.shardNum[shard] {
-		// args.Num > kv.shardCfgNum+1：太新的删除请求，不可能，除非changConfigTo没有对freeze的返回值进行判断
-		// args.Num < kv.shardCfgNum+1: 过期的删除请求，之前已经删除过了
-	}
+		// 过期的删除请求，之前已经删除过了
+		reply.Err = rpc.ErrWrongGroup
+	} else if args.Num == kv.shardNum[shard] {
+		// 之前删除过了，响应丢失，controller重试
+		reply.Err = rpc.OK
+	} else {
+		// args.Num > kv.shardCfgNum+1：太新的删除请求不可能出现
+		// changeConfigTo只接受比当前配置版本号大1的配置更新
+		// 所以，controller不可能发出一个版本号大于kv.shardCfgNum+1的删除请求
 
-	if kv.frozen[shard] == true {
-		// 删除之前必须被冻结
-		delete(kv.data, shard)
-		kv.shardNum[shard] = args.Num // 配置版本更新
+		if kv.frozen[shard] == false {
+			// 没有冻结，说明之前的freeze请求丢失了，controller重试，返回错误让controller重试freeze
+			reply.Err = rpc.ErrWrongGroup
+		} else {
+			// 正常删除
+			delete(kv.data, shard)
+			kv.shardNum[shard] = args.Num
+			reply.Err = rpc.OK
+		}
 	}
-
-	reply.Err = rpc.OK
 }
 
 // Delete the specified shard.
@@ -357,10 +346,18 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 
 	kv := &KVServer{gid: gid, me: me}
 	kv.data = make(map[shardcfg.Tshid]map[string]ValueEntry)
-
-	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	kv.frozen = make(map[shardcfg.Tshid]bool)
 	kv.shardNum = make(map[shardcfg.Tshid]shardcfg.Tnum)
+	if gid == shardcfg.Gid1 && persister.RaftStateSize() == 0 && persister.SnapshotSize() == 0 {
+		// Config #1 assigns all shards to Gid1, so a brand-new Gid1 starts
+		// out owning empty maps for every shard.
+		for shard := shardcfg.Tshid(0); shard < shardcfg.NShards; shard++ {
+			kv.data[shard] = make(map[string]ValueEntry)
+			kv.shardNum[shard] = shardcfg.NumFirst
+		}
+	}
+
+	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 
 	return []any{kv, kv.rsm.Raft()}
 }

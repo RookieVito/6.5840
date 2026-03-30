@@ -8,6 +8,14 @@ import (
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp/shardrpc"
 	tester "6.5840/tester1"
+	"fmt"
+)
+
+const (
+	// 超时时间
+	TIMEOUT = 10 * time.Second
+	// 发送最小间隔
+	SENDINTERVAL = 50 * time.Millisecond
 )
 
 type Clerk struct {
@@ -31,102 +39,91 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	args := rpc.GetArgs{Key: key}
 	start := time.Now()
 	for {
-		if time.Since(start) > 5*time.Second {
+		if time.Since(start) > TIMEOUT {
+			// 分片组可能已经被controller迁出了，或者网络异常导致一直无法联系到leader了，返回错误
 			return "", 0, rpc.ErrWrongGroup
 		}
+
 		reply := rpc.GetReply{}
 		ck.mu.Lock()
 		leader := ck.leader
 		ck.mu.Unlock()
 		ok := ck.Call(ck.servers[leader], "KVServer.Get", &args, &reply)
-		if ok {
-			if reply.Err == rpc.ErrWrongLeader {
-				ck.mu.Lock()
-				ck.leader = (ck.leader + 1) % len(ck.servers)
-				ck.mu.Unlock()
-				continue
-			} else {
-				if reply.Err == rpc.ErrNoKey {
-					// 没有该键值对
-					return "", 0, rpc.ErrNoKey
-				}
-				if reply.Err == rpc.OK {
-					// Get成功，正常返回
-					return reply.Value, reply.Version, reply.Err
-				}
-				if reply.Err == rpc.ErrWrongGroup {
-					return reply.Value, reply.Version, reply.Err
-				}
+
+		if ok && reply.Err != rpc.ErrWrongLeader {
+			// 网络良好，且leader正确
+			// rpc.OK rpc.ErrNoKey rpc.ErrWrongGroup
+			switch reply.Err {
+			case rpc.ErrWrongGroup:
+				return reply.Value, reply.Version, reply.Err
+			case rpc.ErrNoKey:
+				return "", 0, reply.Err
+			case rpc.OK:
+				return reply.Value, reply.Version, reply.Err
+			default:
+				// 不应该出现的错误
+				fmt.Printf("unexpected error: %v\n", reply.Err)
+				return "", 0, reply.Err
 			}
 		} else {
-			// 当前leader的网络不可靠问题，可能已经不是leader了，换其他的服务器试试
+			// 1. 网络不良好，重试
+			// 2. 网络良好，但leader错误，重试
 			ck.mu.Lock()
 			ck.leader = (ck.leader + 1) % len(ck.servers)
 			ck.mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(SENDINTERVAL)
 		}
 	}
 }
 
-func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
+func (ck *Clerk) Put(key string, value string, version rpc.Tversion) (rpc.Err, bool) {
 	args := rpc.PutArgs{
 		Key:     key,
 		Value:   value,
 		Version: version,
 	}
 
-	count := 1
 	start := time.Now()
+	maybeLost := false
 	for {
-		if time.Since(start) > 5*time.Second {
-			return rpc.ErrWrongGroup
+		if time.Since(start) > TIMEOUT {
+			return rpc.ErrWrongGroup, maybeLost
 		}
 		reply := rpc.PutReply{}
 		ck.mu.Lock()
 		leader := ck.leader
 		ck.mu.Unlock()
 		ok := ck.Call(ck.servers[leader], "KVServer.Put", &args, &reply)
-		if ok {
-			if reply.Err == rpc.ErrWrongLeader {
-				ck.mu.Lock()
-				ck.leader = (ck.leader + 1) % len(ck.servers)
-				ck.mu.Unlock()
-				count++
-				continue
-			} else {
 
-				if reply.Err == rpc.OK {
-					return rpc.OK
+		if ok && reply.Err != rpc.ErrWrongLeader {
+			// 网络良好，且leader正确
+			// rpc.OK rpc.ErrVersion rpc.ErrNoKey rpc.ErrWrongGroup
+			switch reply.Err {
+			case rpc.ErrVersion:
+				if maybeLost {
+					return rpc.ErrMaybe, true
 				}
-
-				if reply.Err == rpc.ErrVersion && count == 1 {
-					return rpc.ErrVersion
-				}
-
-				if reply.Err == rpc.ErrVersion && count != 1 {
-					//如果是重发，errmaybe
-					return rpc.ErrMaybe
-				}
-
-				if reply.Err == rpc.ErrNoKey {
-					return rpc.ErrNoKey
-				}
-
-				if reply.Err == rpc.ErrMaybe {
-					return rpc.ErrMaybe
-				}
-
-				if reply.Err == rpc.ErrWrongGroup {
-					return rpc.ErrWrongGroup
-				}
+				return rpc.ErrVersion, false
+			case rpc.ErrWrongGroup:
+				return rpc.ErrWrongGroup, maybeLost
+			case rpc.OK:
+				return rpc.OK, false
+			default:
+				// 不应该出现的错误
+				fmt.Printf("unexpected error: %v\n", reply.Err)
+				return reply.Err, maybeLost
 			}
-		} else {
-			count++
-			ck.mu.Lock()
-			ck.leader = (ck.leader + 1) % len(ck.servers)
-			ck.mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
 		}
+
+		// 1. 网络不良好，重试
+		// 2. 网络良好，但leader错误，重试
+		ck.mu.Lock()
+		ck.leader = (ck.leader + 1) % len(ck.servers)
+		ck.mu.Unlock()
+		if !ok {
+			maybeLost = true
+		}
+		time.Sleep(SENDINTERVAL)
 	}
 }
 
@@ -160,7 +157,7 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 			}
 		} else {
 			// 网络不可靠，换节点重试
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(SENDINTERVAL)
 		}
 		ck.mu.Lock()
 		ck.leader = (ck.leader + 1) % len(ck.servers)
@@ -193,7 +190,7 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 				continue
 			}
 		} else {
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(SENDINTERVAL)
 		}
 		ck.mu.Lock()
 		ck.leader = (ck.leader + 1) % len(ck.servers)
@@ -225,7 +222,7 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 				continue
 			}
 		} else {
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(SENDINTERVAL)
 		}
 		ck.mu.Lock()
 		ck.leader = (ck.leader + 1) % len(ck.servers)

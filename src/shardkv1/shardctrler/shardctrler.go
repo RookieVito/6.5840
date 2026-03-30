@@ -90,6 +90,8 @@ func (sck *ShardCtrler) updateConfig(new *shardcfg.ShardConfig) {
 // TODO 更改配置
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	clerks := make(map[tester.Tgid]*shardgrp.Clerk)
+
+	// 获取shardgrp clerk的函数，使用map缓存已经创建的clerk，避免重复创建
 	var mu sync.Mutex
 	getClerk := func(gid tester.Tgid, srvs []string) *shardgrp.Clerk {
 		mu.Lock()
@@ -111,7 +113,6 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	}
 
 	// fmt.Println("old:", old.String(), "\nnew:", new.String())
-
 	// 1.根据配置变更的情况，迁移分片
 	var wg sync.WaitGroup
 	for shard := shardcfg.Tshid(0); shard < shardcfg.NShards; shard++ {
@@ -124,9 +125,9 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		wg.Add(1)
 		go func(shard shardcfg.Tshid, oldGid, newGid tester.Tgid) {
 			defer wg.Done()
-
 			if oldGid == 0 {
 				// 初始状态，该分片从未被分配过，直接安装空状态
+				fmt.Println("oldGid == 0, shard:", shard, " to ", newGid)
 				newClerk := getClerk(newGid, new.Groups[newGid])
 				newClerk.InstallShard(shard, nil, new.Num)
 				return
@@ -135,6 +136,7 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 			if newGid == 0 {
 				// 组退出后 Rebalance，理论上不应出现 newGid==0
 				// 除非所有组都离开了，此时直接冻结删除
+				fmt.Println("newGid == 0, shard:", shard, " from ", oldGid)
 				oldClerk := getClerk(oldGid, old.Groups[oldGid])
 				oldClerk.FreezeShard(shard, new.Num)
 				oldClerk.DeleteShard(shard, new.Num)
