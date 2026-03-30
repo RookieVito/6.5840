@@ -15,11 +15,6 @@
   - `kvtest1/`：测试工具与线性化检查
   - `tester1/`：实验测试框架
 
-## 依赖
-
-- Go 1.22
-- `github.com/anishathalye/porcupine`（已在 `src/go.mod` 中声明）
-
 ## 编译与测试
 
 进入 `src` 目录后执行：
@@ -51,20 +46,6 @@ cd src
 make kvsrv1 RUN="-run Wc"
 ```
 
-## 提交打包
-
-根目录下的 `Makefile` 提供了打包提交的目标。可用目标包括：
-
-`lab1 lab2 lab3a lab3b lab3c lab3d lab4a lab4b lab4c lab5a lab5b lab5c`
-
-例如打包 `lab1`：
-
-```bash
-make lab1
-```
-
-这会生成 `lab1-handin.tar.gz`，用于上传到 Gradescope。
-
 ## 说明
 
 - `src/main/` 下包含各个实验可执行程序的入口文件，如 `kvsrv1d.go`、`raft1d.go`、`kvraft1d.go`、`mrcoordinator.go`、`mrsequential.go`、`mrworker.go`、`shardgrp1d.go` 等。
@@ -80,3 +61,19 @@ make lab1
 - `src/mrapps/`：MapReduce 应用插件
 - `src/kvtest1/`：线性化测试与模型检查
 - `src/tester1/`：实验测试环境与网络模拟
+
+## 待办事项
+
+- [x] Lab 1: MapReduce
+- [x] Lab 2: Key/Value Server
+- [x] Lab 3A: Raft leader election
+- [x] Lab 3B: Raft log
+- [x] Lab 3C: Raft persistence
+- [x] Lab 3D: Raft log compaction
+- [x] Lab 4A: FT KV Service replicated state machine (RSM)
+- [x] Lab 4B: FT KV Service Key/value service without snapshots
+- [x] Lab 4C: FT KV Key/value service with snapshots
+- [x] Lab 5A: Sharded KV Service Moving shards
+- [ ] Lab 5B: Sharded KV Handling a failed controller
+- [ ] Lab 5C: Sharded KV Concurrent configuration changes
+- [ ] Lab 5D: extend
