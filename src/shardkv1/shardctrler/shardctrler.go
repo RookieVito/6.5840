@@ -17,7 +17,7 @@ import (
 	tester "6.5840/tester1"
 )
 
-const configKey string = "shardcfg"
+const curCfgKey string = "curCfg"
 
 // ShardCtrler for the controller and kv clerk.
 type ShardCtrler struct {
@@ -51,18 +51,18 @@ func (sck *ShardCtrler) InitController() {
 // 把配置存储在lab2 的kvsrv
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 	// 传递cfg到kvsrv
-	sck.Put(configKey, cfg.String(), rpc.Tversion(0))
+	sck.Put(curCfgKey, cfg.String(), rpc.Tversion(0))
 }
 
 func (sck *ShardCtrler) updateConfig(new *shardcfg.ShardConfig) {
 	// CAS判断写入kvsrv
 	for {
-		_, ver, err := sck.Get(configKey)
+		_, ver, err := sck.Get(curCfgKey)
 		if err != rpc.OK {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		err = sck.Put(configKey, new.String(), ver)
+		err = sck.Put(curCfgKey, new.String(), ver)
 		if err == rpc.OK {
 			return // 成功
 		}
@@ -71,7 +71,7 @@ func (sck *ShardCtrler) updateConfig(new *shardcfg.ShardConfig) {
 		}
 		if err == rpc.ErrMaybe {
 			// 验证是否实际成功
-			val, _, getErr := sck.Get(configKey)
+			val, _, getErr := sck.Get(curCfgKey)
 			if getErr == rpc.OK {
 				if val == new.String() {
 					return // 实际成功了
@@ -172,7 +172,7 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 // 返回当前的配置，负责从kvsrv读取配置
 func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
 	for {
-		val, _, err := sck.Get(configKey)
+		val, _, err := sck.Get(curCfgKey)
 		if err == rpc.OK {
 			return shardcfg.FromString(val)
 		}
