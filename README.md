@@ -74,6 +74,6 @@ make kvsrv1 RUN="-run Wc"
 - [x] Lab 4B: FT KV Service Key/value service without snapshots
 - [x] Lab 4C: FT KV Key/value service with snapshots
 - [x] Lab 5A: Sharded KV Service Moving shards
-- [ ] Lab 5B: Sharded KV Handling a failed controller
-- [ ] Lab 5C: Sharded KV Concurrent configuration changes
+- [x] Lab 5B: Sharded KV Handling a failed controller
+- [x] Lab 5C: Sharded KV Concurrent configuration changes
 - [ ] Lab 5D: extend
