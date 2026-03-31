@@ -70,16 +70,25 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 			if err == rpc.OK || err == rpc.ErrNoKey {
 				return value, version, err
 			}
+			switch err {
+			case rpc.OK:
+				return value, version, err
+			case rpc.ErrNoKey:
+				return value, version, err
+			default:
+				// err == rpc.ErrWrongGroup || err == rpc.ErrMaybe
+				ck.refreshConfig()
+			}
+		} else {
+			// 没有找到group对应的clerk，说明配置应该更新
+			ck.refreshConfig()
 		}
-
-		// err == rpc.ErrWrongGroup || ok == false
-		// 组错误或者没有找到group对应的clerk，说明配置应该更新
-		ck.refreshConfig()
 	}
 }
 
 // Put a key to a shard group.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
+	maybeLost := false
 	for {
 		ck.mu.Lock()
 		shard := shardcfg.Key2Shard(key) // key -> shard
@@ -89,17 +98,28 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		var err rpc.Err
 		if ok {
 			// 找到了 group的clerk
-			err = grpCk.Put(key, value, version)
-
-			if err == rpc.ErrMaybe || err == rpc.ErrVersion || err == rpc.OK {
+			var ambiguous bool
+			err, ambiguous = grpCk.Put(key, value, version)
+			maybeLost = maybeLost || ambiguous
+			switch err {
+			case rpc.ErrMaybe:
 				return err
+			case rpc.ErrVersion:
+				if maybeLost {
+					return rpc.ErrMaybe
+				}
+				return err
+			case rpc.OK:
+				return err
+			default:
+				// err == rpc.ErrWrongGroup
+				ck.refreshConfig()
 			}
-
+		} else {
+			// err == rpc.ErrWrongGroup || ok == false
+			// 组错误或者没有找到group对应的clerk，说明配置应该更新
+			ck.refreshConfig()
 		}
-
-		// err == rpc.ErrWrongGroup || ok == false
-		// 组错误或者没有找到group对应的clerk，说明配置应该更新
-		ck.refreshConfig()
 	}
 }
 
