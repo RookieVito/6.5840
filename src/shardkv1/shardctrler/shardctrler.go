@@ -5,7 +5,6 @@ package shardctrler
 //
 
 import (
-	"fmt"
 	"sync"
 	"time"
 
@@ -17,7 +16,10 @@ import (
 	tester "6.5840/tester1"
 )
 
-const curCfgKey string = "curCfg"
+const (
+	curCfgKey  string = "curCfg"
+	nextCfgKey string = "nextCfg"
+)
 
 // ShardCtrler for the controller and kv clerk.
 type ShardCtrler struct {
@@ -33,7 +35,6 @@ func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
 	sck := &ShardCtrler{clnt: clnt}
 	srv := tester.ServerName(tester.GRP0, 0)
 	sck.IKVClerk = kvsrv.MakeClerk(clnt, srv)
-	// Your code here.
 	return sck
 }
 
@@ -41,6 +42,14 @@ func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
 // controller. In part A, this method doesn't need to do anything. In
 // B and C, this method implements recovery.
 func (sck *ShardCtrler) InitController() {
+	for {
+		cur := sck.readConfig(curCfgKey)
+		next := sck.readConfig(nextCfgKey)
+		if next.Num <= cur.Num {
+			return
+		}
+		sck.finishConfigChange(cur, next)
+	}
 }
 
 // Called once by the tester to supply the first configuration.  You
@@ -48,136 +57,280 @@ func (sck *ShardCtrler) InitController() {
 // then Put it in the kvsrv for the controller at version 0.  You can
 // pick the key to name the configuration.  The initial configuration
 // lists shardgrp shardcfg.Gid1 for all shards.
-// 把配置存储在lab2 的kvsrv
+// InitConfig initializes both the committed config and the pending
+// config so that recovery always starts from a consistent base.
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
-	// 传递cfg到kvsrv
-	sck.Put(curCfgKey, cfg.String(), rpc.Tversion(0))
+	sck.ensureConfig(curCfgKey, cfg)
+	sck.ensureConfig(nextCfgKey, cfg)
 }
 
-func (sck *ShardCtrler) updateConfig(new *shardcfg.ShardConfig) {
+// ensureConfig stores cfg under key and treats ErrMaybe as success if a
+// follow-up Get confirms the desired value is already present.
+func (sck *ShardCtrler) ensureConfig(key string, cfg *shardcfg.ShardConfig) {
+	want := cfg.String()
 	// CAS判断写入kvsrv
 	for {
-		_, ver, err := sck.Get(curCfgKey)
-		if err != rpc.OK {
-			time.Sleep(50 * time.Millisecond)
+		val, ver, err := sck.Get(key)
+		if err == rpc.OK {
+			if val == want {
+				return
+			}
+			err = sck.Put(key, want, ver)
+			if err == rpc.OK {
+				return
+			}
+			if err == rpc.ErrMaybe {
+				got, _, getErr := sck.Get(key)
+				if getErr == rpc.OK && got == want {
+					return
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
 			continue
 		}
-		err = sck.Put(curCfgKey, new.String(), ver)
-		if err == rpc.OK {
-			return // 成功
+		if err == rpc.ErrNoKey {
+			err = sck.Put(key, want, rpc.Tversion(0))
+			if err == rpc.OK {
+				return
+			}
+			if err == rpc.ErrMaybe {
+				got, _, getErr := sck.Get(key)
+				if getErr == rpc.OK && got == want {
+					return
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			continue
 		}
-		if err == rpc.ErrVersion {
-			return // 被其他 controller 抢先，已被 superseded
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// readConfig blocks until it can read and decode a configuration from
+// the controller's backing kvsrv.
+func (sck *ShardCtrler) readConfig(key string) *shardcfg.ShardConfig {
+	for {
+		val, _, err := sck.Get(key)
+		if err != rpc.OK {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		return shardcfg.FromString(val)
+	}
+}
+
+// tryAdvanceConfig CAS-updates one stored configuration from "from" to
+// "to". It returns false if another controller has already changed the
+// key to a conflicting value.
+func (sck *ShardCtrler) tryAdvanceConfig(key string, from, to *shardcfg.ShardConfig) bool {
+	want := to.String()
+	for {
+		val, ver, err := sck.Get(key)
+		if err != rpc.OK {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		cur := shardcfg.FromString(val)
+		if cur.Num >= to.Num {
+			return true
+		}
+		if cur.Num != from.Num || val != from.String() {
+			return false
+		}
+		err = sck.Put(key, want, ver)
+		if err == rpc.OK {
+			return true
 		}
 		if err == rpc.ErrMaybe {
-			// 验证是否实际成功
-			val, _, getErr := sck.Get(curCfgKey)
+			got, _, getErr := sck.Get(key)
 			if getErr == rpc.OK {
-				if val == new.String() {
-					return // 实际成功了
+				if got == want {
+					return true
 				}
-				return // 被 superseded
+				if got != from.String() {
+					return false
+				}
 			}
-			time.Sleep(50 * time.Millisecond)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// configSuperseded reports whether a target configuration has already
+// been committed or replaced by a newer pending configuration.
+func (sck *ShardCtrler) configSuperseded(target shardcfg.Tnum) bool {
+	cur := sck.readConfig(curCfgKey)
+	if cur.Num >= target {
+		return true
+	}
+	next := sck.readConfig(nextCfgKey)
+	return next.Num > target
+}
+
+// getShardClerkFactory memoizes shardgrp clerks per gid so migration
+// workers can reuse RPC clients safely across goroutines.
+func (sck *ShardCtrler) getShardClerkFactory() func(gid tester.Tgid, srvs []string) *shardgrp.Clerk {
+	clerks := make(map[tester.Tgid]*shardgrp.Clerk)
+	var mu sync.Mutex
+	return func(gid tester.Tgid, srvs []string) *shardgrp.Clerk {
+		mu.Lock()
+		defer mu.Unlock()
+		if _, ok := clerks[gid]; !ok {
+			clerks[gid] = shardgrp.MakeClerk(sck.clnt, srvs)
+		}
+		return clerks[gid]
+	}
+}
+
+// moveShard executes the migration protocol for a single shard. The
+// protocol is written to be retryable so a recovering controller can
+// resume an interrupted configuration change.
+func (sck *ShardCtrler) moveShard(old, new *shardcfg.ShardConfig, shard shardcfg.Tshid, getClerk func(gid tester.Tgid, srvs []string) *shardgrp.Clerk) {
+	oldGid := old.Shards[shard]
+	newGid := new.Shards[shard]
+	if oldGid == newGid {
+		return
+	}
+
+	if oldGid == 0 {
+		newClerk := getClerk(newGid, new.Groups[newGid])
+		for {
+			err := newClerk.InstallShard(shard, nil, new.Num)
+			if err == rpc.OK {
+				return
+			}
+			if err == rpc.ErrWrongGroup && sck.configSuperseded(new.Num) {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
+
+	oldClerk := getClerk(oldGid, old.Groups[oldGid])
+	if newGid == 0 {
+		for {
+			_, err := oldClerk.FreezeShard(shard, new.Num)
+			if err != rpc.OK {
+				if err == rpc.ErrWrongGroup && sck.configSuperseded(new.Num) {
+					return
+				}
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			break
+		}
+		for {
+			err := oldClerk.DeleteShard(shard, new.Num)
+			if err == rpc.OK {
+				return
+			}
+			if err == rpc.ErrWrongGroup && sck.configSuperseded(new.Num) {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	newClerk := getClerk(newGid, new.Groups[newGid])
+	var state []byte
+	for {
+		var err rpc.Err
+		state, err = oldClerk.FreezeShard(shard, new.Num)
+		if err == rpc.OK {
+			break
+		}
+		if err == rpc.ErrWrongGroup {
+			if sck.configSuperseded(new.Num) {
+				return
+			}
+			state = nil
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	for {
+		err := newClerk.InstallShard(shard, state, new.Num)
+		if err == rpc.OK {
+			break
+		}
+		if err == rpc.ErrWrongGroup && sck.configSuperseded(new.Num) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	for {
+		err := oldClerk.DeleteShard(shard, new.Num)
+		if err == rpc.OK {
+			return
+		}
+		if err == rpc.ErrWrongGroup && sck.configSuperseded(new.Num) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// finishConfigChange migrates all shards that differ between old and
+// new, then commits new as the current configuration.
+func (sck *ShardCtrler) finishConfigChange(old, new *shardcfg.ShardConfig) {
+	if old.Num >= new.Num {
+		return
+	}
+
+	getClerk := sck.getShardClerkFactory()
+	var wg sync.WaitGroup
+	for shard := shardcfg.Tshid(0); shard < shardcfg.NShards; shard++ {
+		if old.Shards[shard] == new.Shards[shard] {
+			continue
+		}
+		wg.Add(1)
+		go func(shard shardcfg.Tshid) {
+			defer wg.Done()
+			sck.moveShard(old, new, shard, getClerk)
+		}(shard)
+	}
+	wg.Wait()
+	sck.tryAdvanceConfig(curCfgKey, old, new)
 }
 
 // Called by the tester to ask the controller to change the
 // configuration from the current one to new.  While the controller
 // changes the configuration it may be superseded by another
 // controller.
-// TODO 更改配置
+// ChangeConfigTo first records the target in nextCfg, then finishes any
+// outstanding migration before advancing curCfg.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
-	clerks := make(map[tester.Tgid]*shardgrp.Clerk)
-
-	// 获取shardgrp clerk的函数，使用map缓存已经创建的clerk，避免重复创建
-	var mu sync.Mutex
-	getClerk := func(gid tester.Tgid, srvs []string) *shardgrp.Clerk {
-		mu.Lock()
-		defer mu.Unlock()
-		// 没有则创建，有则直接返回
-		if _, ok := clerks[gid]; !ok {
-			clerks[gid] = shardgrp.MakeClerk(sck.clnt, srvs)
+	for {
+		cur := sck.readConfig(curCfgKey)
+		if cur.Num >= new.Num {
+			return
 		}
-		return clerks[gid]
-	}
 
-	// 完成Freeze/Install/Delete
-
-	// 获取旧的配置，且必须是相邻的配置，如果不是，说明有配置没有被完整完成或者这是一个太旧的配置，暂时不设置超时
-	old := sck.Query()
-	for old.Num+1 != new.Num {
-		fmt.Println("changeConfigTo: query loop")
-		old = sck.Query()
-	}
-
-	// fmt.Println("old:", old.String(), "\nnew:", new.String())
-	// 1.根据配置变更的情况，迁移分片
-	var wg sync.WaitGroup
-	for shard := shardcfg.Tshid(0); shard < shardcfg.NShards; shard++ {
-		oldGid := old.Shards[shard]
-		newGid := new.Shards[shard]
-		if oldGid == newGid {
+		next := sck.readConfig(nextCfgKey)
+		if next.Num < cur.Num {
+			sck.tryAdvanceConfig(nextCfgKey, next, cur)
 			continue
 		}
-
-		wg.Add(1)
-		go func(shard shardcfg.Tshid, oldGid, newGid tester.Tgid) {
-			defer wg.Done()
-			if oldGid == 0 {
-				// 初始状态，该分片从未被分配过，直接安装空状态
-				fmt.Println("oldGid == 0, shard:", shard, " to ", newGid)
-				newClerk := getClerk(newGid, new.Groups[newGid])
-				newClerk.InstallShard(shard, nil, new.Num)
-				return
-			}
-
-			if newGid == 0 {
-				// 组退出后 Rebalance，理论上不应出现 newGid==0
-				// 除非所有组都离开了，此时直接冻结删除
-				fmt.Println("newGid == 0, shard:", shard, " from ", oldGid)
-				oldClerk := getClerk(oldGid, old.Groups[oldGid])
-				oldClerk.FreezeShard(shard, new.Num)
-				oldClerk.DeleteShard(shard, new.Num)
-				return
-			}
-
-			oldClerk := getClerk(oldGid, old.Groups[oldGid])
-			newClerk := getClerk(newGid, new.Groups[newGid])
-			// fmt.Println("shard:", shard, " : ", oldGid, " to ", newGid)
-			state, err := oldClerk.FreezeShard(shard, new.Num) // 1 FreezeShard
-			if err != rpc.OK {
-				fmt.Println("shard:", shard, " : ", oldGid, " to ", newGid, " freeze failure:", err)
-				return
-			}
-			err = newClerk.InstallShard(shard, state, new.Num) // 2 InstallShard
-			if err != rpc.OK {
-				fmt.Println("shard:", shard, " : ", oldGid, " to ", newGid, "install failure:", err)
-				return
-			}
-			err = oldClerk.DeleteShard(shard, new.Num) // 3 DeleteShard
-			if err != rpc.OK {
-				fmt.Println("shard:", shard, " : ", oldGid, " to ", newGid, "delete failure:", err)
-				return
-			}
-		}(shard, oldGid, newGid)
+		if next.Num > cur.Num {
+			sck.finishConfigChange(cur, next)
+			continue
+		}
+		if cur.Num+1 != new.Num {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		if !sck.tryAdvanceConfig(nextCfgKey, cur, new) {
+			continue
+		}
+		sck.finishConfigChange(cur, new)
+		return
 	}
-	wg.Wait()
-
-	// 需要迁移的分片完成迁移，更新配置
-	sck.updateConfig(new)
-
 }
 
 // Return the current configuration
-// 返回当前的配置，负责从kvsrv读取配置
+// Query returns the latest committed configuration.
 func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
-	for {
-		val, _, err := sck.Get(curCfgKey)
-		if err == rpc.OK {
-			return shardcfg.FromString(val)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	return sck.readConfig(curCfgKey)
 }

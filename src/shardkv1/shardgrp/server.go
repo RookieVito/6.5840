@@ -199,6 +199,13 @@ func (kv *KVServer) freezeShardOp(args *shardrpc.FreezeShardArgs, reply *shardrp
 		reply.Err = rpc.ErrWrongGroup
 		return
 	}
+	if args.Num == kv.shardNum[shard] {
+		// 分片已经在该配置号下完成迁移；恢复中的 controller 会重复发起
+		// FreezeShard，这里直接返回 OK，避免重新创建已删除的空分片。
+		reply.Num = args.Num
+		reply.Err = rpc.OK
+		return
+	}
 
 	// 冻结不改变配置版本号，安装和删除分片时才更新配置版本号
 	kv.frozen[shard] = true

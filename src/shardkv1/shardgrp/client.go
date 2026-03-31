@@ -1,6 +1,7 @@
 package shardgrp
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -8,7 +9,6 @@ import (
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp/shardrpc"
 	tester "6.5840/tester1"
-	"fmt"
 )
 
 const (
@@ -183,6 +183,9 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 			if reply.Err == rpc.OK {
 				return reply.Err
 			}
+			if reply.Err == rpc.ErrWrongGroup {
+				return reply.Err
+			}
 			if reply.Err == rpc.ErrWrongLeader {
 				ck.mu.Lock()
 				ck.leader = (ck.leader + 1) % len(ck.servers)
@@ -212,6 +215,9 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 		// fmt.Printf("DeleteShard: ok=%v server=%v reply=%v\n", ok, ck.servers[ck.leader], reply)
 		if ok {
 			if reply.Err == rpc.OK {
+				return reply.Err
+			}
+			if reply.Err == rpc.ErrWrongGroup {
 				return reply.Err
 			}
 
